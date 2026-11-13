@@ -3,6 +3,8 @@ from odoo import api, models
 from odoo.tools.sql import column_exists, table_exists
 import logging
 
+from psycopg2.extras import execute_values
+
 logger = logging.getLogger(__name__)
 
 
@@ -23,6 +25,18 @@ def _get_max_column_width(cr, tablename, fieldname):
     if not rec:
         return None
     return rec[0]
+
+
+BATCH_SIZE = 1000
+
+
+def _get_column_type(cr, tablename, fieldname):
+    cr.execute(
+        "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a "
+        "WHERE a.attrelid = %s::regclass AND a.attname = %s",
+        (tablename, fieldname),
+    )
+    return cr.fetchone()[0]
 
 
 def tabletype(cr, tablename):
@@ -53,14 +67,21 @@ class Anonymizer(models.AbstractModel):
             )
 
     def _delete_mail_tracking_values(self):
+        cr = self.env.cr
+        # from 20.0 on the table only exists with the module mail_tracking
+        if not table_exists(cr, "mail_tracking_value"):
+            return
+        # the tracked field is stored in "field" up to 16.0, in "field_id" after
+        column = (
+            "field_id" if column_exists(cr, "mail_tracking_value", "field_id") else "field"
+        )
         for field in self.env["ir.model.fields"].search([("anonymize", "!=", False)]):
-            self.env.cr.execute(
-                """
-                delete from mail_tracking_value where field = %s
-                and
-                mail_message_id in (select id from mail_message where model=%s)
+            cr.execute(
+                f"""
+                delete from mail_tracking_value where {column} = %s
+                and mail_message_id in (select id from mail_message where model=%s)
             """,
-                (field.id, field.model_id.model),
+                (field.id, field.model),
             )
 
     @api.model
@@ -76,7 +97,7 @@ class Anonymizer(models.AbstractModel):
                 )
         if not force and os.environ.get("DEVMODE") != "1":
             return
-        import names
+        import names  # noqa: F401 - fail early if the library is missing
 
         KEY = "db.anonymized"
         if (
@@ -164,27 +185,33 @@ class Anonymizer(models.AbstractModel):
             res.append(new_rec)
         return res
 
-    def _update_table_with_new_values(self, table, new_values):
+    def _update_table_with_new_values(self, table, new_values, commit=True):
         if not new_values:
             return
 
         sql_fields = list(sorted(filter(lambda x: x != "id", new_values[0].keys())))
-        updates = []
-        for field in sql_fields:
-            updates.append(f" {field} = %s")
-        sql_updates = ",".join(updates)
-        del updates
-
-        for i, rec in enumerate(new_values):
-            sql_values = [rec[x] for x in sql_fields]
-            self.env.cr.execute(
-                f"update {table} set {sql_updates} where id = %s",
-                tuple(sql_values + [rec["id"]]),
+        # one statement per batch instead of one per row (1.7 mio. mail
+        # messages took hours); the values keep the column types of the table
+        sql_updates = ",".join(f'"{field}" = v."{field}"' for field in sql_fields)
+        columns = ",".join(f'"{field}"' for field in ["id"] + sql_fields)
+        casts = ",".join(
+            f"%s::{_get_column_type(self.env.cr, table, field)}"
+            for field in ["id"] + sql_fields
+        )
+        for start in range(0, len(new_values), BATCH_SIZE):
+            batch = new_values[start : start + BATCH_SIZE]
+            execute_values(
+                self.env.cr._obj,
+                f'update "{table}" t set {sql_updates} '
+                f"from (values %s) as v({columns}) where t.id = v.id",
+                [tuple(rec[x] for x in ["id"] + sql_fields) for rec in batch],
+                template=f"({casts})",
+                page_size=BATCH_SIZE,
             )
-            if not i % 100:
-                quote = round(i / len(new_values) * 100, 1)
-                logger.info(
-                    f"{table} Writing to database done {i} of "
-                    f"{len(new_values)}: {quote:.1f}%"
-                )
+            done = start + len(batch)
+            logger.info(
+                f"{table} Writing to database done {done} of "
+                f"{len(new_values)}: {done / len(new_values) * 100:.1f}%"
+            )
+            if commit:
                 self.env.cr.commit()
