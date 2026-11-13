@@ -46,11 +46,16 @@ class Fields(models.Model):
 
     @api.model
     def _apply_default_anonymize_fields(self, force=False):
-        if not force and self.search_count([("anonymize", "!=", False)]):
-            return
-        for dbfield in self.env["ir.model.fields"].search(
-            [("ttype", "in", ["char", "text"])]
-        ):
+        """Mark the usual personal fields for anonymization.
+
+        Fields that already have a choice keep it (force=True overwrites);
+        previously a single marked field switched off all defaults, so a
+        database with one manual entry was hardly anonymized.
+        """
+        domain = [("ttype", "in", ["char", "text"])]
+        if not force:
+            domain.append(("anonymize", "=", False))
+        for dbfield in self.env["ir.model.fields"].search(domain):
             for x in [
                 ("phone", "phone"),
                 ("lastname", "lastname"),
@@ -80,9 +85,13 @@ class Fields(models.Model):
                             ),
                         )
 
-        for dbfield in self.env["ir.model.fields"].search(
-            [("model", "=", "res.partner"), ("name", "in", ["display_name", "name"])]
-        ):
+        name_domain = [
+            ("model", "=", "res.partner"),
+            ("name", "in", ["display_name", "name"]),
+        ]
+        if not force:
+            name_domain.append(("anonymize", "=", False))
+        for dbfield in self.env["ir.model.fields"].search(name_domain):
             self.env.cr.execute(
                 "update ir_model_fields set anonymize = 'fullname'  where id = %s",
                 (dbfield.id,),
@@ -114,6 +123,8 @@ class Fields(models.Model):
             return names.get_last_name()
         elif self.anonymize == "firstname":
             return names.get_first_name()
+        elif self.anonymize == "street":
+            return f"{names.get_last_name()}str. {random.randint(1, 199)}"
         elif self.anonymize == "email":
             return self.generate_random_email()
         elif self.anonymize == "phone":
