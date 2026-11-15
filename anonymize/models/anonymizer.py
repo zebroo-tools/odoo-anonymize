@@ -53,14 +53,17 @@ class Anonymizer(models.AbstractModel):
             )
 
     def _delete_mail_tracking_values(self):
+        cr = self.env.cr
+        # the module only depends on base: without mail there is no table
+        if not table_exists(cr, "mail_tracking_value"):
+            return
         for field in self.env["ir.model.fields"].search([("anonymize", "!=", False)]):
-            self.env.cr.execute(
+            cr.execute(
                 """
                 delete from mail_tracking_value where field_id = %s
-                and
-                mail_message_id in (select id from mail_message where model=%s)
+                and mail_message_id in (select id from mail_message where model=%s)
             """,
-                (field.id, field.model_id.model),
+                (field.id, field.model),
             )
 
     @api.model
@@ -202,6 +205,8 @@ class Anonymizer(models.AbstractModel):
             return self._FN
         if atype == "lastname":
             return self._LN
+        if atype == "street":
+            return f"{self._LN} || 'str. ' || (mod(id, 199) + 1)"
         if atype == "city":
             return self._CITY
         if atype == "email":
